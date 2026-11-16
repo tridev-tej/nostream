@@ -16,7 +16,7 @@ use nostream_core::{Event, Kind, Pubkey, SettingsPubkey};
 use nostream_relay::wot::WotGraph;
 use nostream_services::services::wot_graph_service::WotGraphService;
 use nostream_services::testing::{self, InMemoryEventRepository};
-use nostream_storage::repositories::EventRepository;
+use nostream_storage::repositories::{EventRecord, EventRepository};
 use std::time::{Duration, Instant};
 
 /// The trait-object view `WotGraphService::new` takes.
@@ -501,6 +501,109 @@ async fn a_cancelled_caller_leaves_the_graph_buildable() {
         .expect("the distance");
 
     assert_eq!(distance, Some(1));
+}
+
+/// A storage read that started before `update_follow_list` cached a newer list must not
+/// replace that list when it returns, or every later rebuild reuses the older follows.
+///
+/// The seed's set is cached, so the first build's only read is A's, and the gate holds it
+/// while A's newer list arrives. Storage still holds A's older list, which that read returns.
+#[tokio::test]
+async fn a_read_in_flight_does_not_overwrite_a_newer_cached_follow_list() {
+    let b_probe = contact_list(&[3; 32], &[]);
+    let c_probe = contact_list(&[4; 32], &[]);
+    let (b, c) = (b_probe.pubkey, c_probe.pubkey);
+    let a_probe = contact_list(&[2; 32], &[]);
+    let a = a_probe.pubkey;
+    let seed_event = contact_list(&[1; 32], &[&a]);
+    let seed = seed_event.pubkey;
+
+    let repository =
+        InMemoryEventRepository::with_events([seed_event, contact_list(&[2; 32], &[&b])]);
+    let settings = wot_settings(true, &seed.to_string(), 2, 1);
+    let service = WotGraphService::new(Arc::new(settings), events(&repository));
+    let gate = repository.gate_reads();
+
+    service
+        .update_follow_list(&seed, &follows(&[&a]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    service
+        .update_follow_list(&a, &follows(&[&c]))
+        .await
+        .unwrap();
+
+    gate.add_permits(16);
+    wait_for_rebuilds(&service, 1).await;
+
+    service
+        .update_follow_list(&seed, &follows(&[&a]))
+        .await
+        .unwrap();
+    wait_for_rebuilds(&service, 2).await;
+
+    assert_eq!(
+        service.get_distance(&c).await.unwrap(),
+        Some(2),
+        "the newer cached list is the one the next rebuild walks"
+    );
+    assert_eq!(service.get_distance(&b).await.unwrap(), None);
+    assert_eq!(repository.reads(), 1, "only the first build read A's row");
+}
+
+/// An empty newer list removes the cached set, and a read in flight must not put the older one
+/// back: the next rebuild has to read A's row again and find the newer, empty list.
+///
+/// The gated read selects its rows only once released, so the newer list is stored after that
+/// read returns rather than before `update_follow_list` as the contact-list strategy does.
+#[tokio::test]
+async fn a_read_in_flight_does_not_restore_a_follow_list_emptied_meanwhile() {
+    let b_probe = contact_list(&[3; 32], &[]);
+    let b = b_probe.pubkey;
+    let a_probe = contact_list(&[2; 32], &[]);
+    let a = a_probe.pubkey;
+    let seed_event = contact_list(&[1; 32], &[&a]);
+    let seed = seed_event.pubkey;
+
+    let repository = InMemoryEventRepository::with_events([
+        seed_event,
+        contact_list_at(&[2; 32], &[&b], 1_700_000_000),
+    ]);
+    let settings = wot_settings(true, &seed.to_string(), 2, 1);
+    let service = WotGraphService::new(Arc::new(settings), events(&repository));
+    let gate = repository.gate_reads();
+
+    service
+        .update_follow_list(&seed, &follows(&[&a]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    service.update_follow_list(&a, &[]).await.unwrap();
+
+    gate.add_permits(16);
+    wait_for_rebuilds(&service, 1).await;
+
+    let emptied = contact_list_at(&[2; 32], &[], 1_700_000_100);
+    repository
+        .create(&EventRecord::from_event(&emptied))
+        .await
+        .unwrap();
+
+    service
+        .update_follow_list(&seed, &follows(&[&a]))
+        .await
+        .unwrap();
+    wait_for_rebuilds(&service, 2).await;
+
+    assert_eq!(
+        service.get_distance(&b).await.unwrap(),
+        None,
+        "the older list was not cached, so the rebuild reads the empty one"
+    );
+    assert_eq!(repository.reads(), 2, "each build read A's row");
 }
 
 /// `contact_list` with the instant a newest-first read discriminates on.

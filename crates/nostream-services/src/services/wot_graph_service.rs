@@ -31,6 +31,9 @@ struct Inner {
     settings: Arc<Settings>,
     events: Arc<dyn EventRepository>,
     follows: Mutex<HashMap<String, Vec<String>>>,
+    /// Bumped under the `follows` lock by every `update_follow_list`, so a storage read that
+    /// was in flight meanwhile does not replace the newer list with the one it read.
+    follows_generation: AtomicU64,
     distances: Mutex<HashMap<String, u32>>,
     ready: AtomicBool,
     building: AtomicBool,
@@ -47,6 +50,7 @@ impl WotGraphService {
                 settings,
                 events,
                 follows: Mutex::new(HashMap::new()),
+                follows_generation: AtomicU64::new(0),
                 distances: Mutex::new(HashMap::new()),
                 ready: AtomicBool::new(false),
                 building: AtomicBool::new(false),
@@ -251,7 +255,7 @@ impl WotGraphService {
     /// One member counts once: a contact list that repeats a `p` tag must not satisfy
     /// `minimum_followers` on its own.
     async fn get_follows(&self, pubkey: &str) -> Result<Vec<String>, ServicesError> {
-        {
+        let generation = {
             let follows = self
                 .inner
                 .follows
@@ -261,7 +265,9 @@ impl WotGraphService {
             if let Some(cached) = follows.get(pubkey).filter(|cached| !cached.is_empty()) {
                 return Ok(cached.clone());
             }
-        }
+
+            self.inner.follows_generation.load(Ordering::SeqCst)
+        };
 
         let filter = Filter {
             kinds: Some(vec![Kind::CONTACT_LIST]),
@@ -292,11 +298,15 @@ impl WotGraphService {
         );
 
         if !follows.is_empty() {
-            self.inner
+            let mut cached = self
+                .inner
                 .follows
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(pubkey.to_owned(), follows.clone());
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            if self.inner.follows_generation.load(Ordering::SeqCst) == generation {
+                cached.insert(pubkey.to_owned(), follows.clone());
+            }
         }
 
         Ok(follows)
@@ -321,6 +331,7 @@ impl WotGraph for WotGraphService {
                     .follows
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.inner.follows_generation.fetch_add(1, Ordering::SeqCst);
                 cached.remove(&key);
 
                 let follows = deduplicated(follows.iter().map(String::as_str));
